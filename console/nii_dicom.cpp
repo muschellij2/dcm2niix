@@ -728,6 +728,7 @@ struct TDICOMdata clear_dicom_data() {
     strcpy(d.scanOptions, "");
     //strcpy(d.mrAcquisitionType, "");
     strcpy(d.seriesInstanceUID, "");
+    strcpy(d.instanceUID, "");
     strcpy(d.studyID, "");
     strcpy(d.studyInstanceUID, "");
     strcpy(d.bodyPartExamined,"");
@@ -4048,6 +4049,8 @@ struct TDICOMdata readDICOMv(char * fname, int isVerbose, int compressFlag, stru
 #define  kDirectoryRecordSequence 0x0004+(0x1220 << 16 )
 //#define  kSpecificCharacterSet 0x0008+(0x0005 << 16 ) //someday we should handle foreign characters...
 #define  kImageTypeTag 0x0008+(0x0008 << 16 )
+//#define  kSOPInstanceUID 0x0008+(0x0018 << 16 ) //Philips inserts time as last item, e.g. ?.?.?.YYYYMMDDHHmmSS.SSSS
+// not reliable  https://neurostars.org/t/heudiconv-no-extraction-of-slice-timing-data-based-on-philips-dicoms/2201/21
 #define  kStudyDate 0x0008+(0x0020 << 16 )
 #define  kAcquisitionDate 0x0008+(0x0022 << 16 )
 #define  kAcquisitionDateTime 0x0008+(0x002A << 16 )
@@ -4300,6 +4303,7 @@ double TE = 0.0; //most recent echo time recorded
     char acquisitionDateTimeTxt[kDICOMStr] = "";
     bool isEncapsulatedData = false;
     int multiBandFactor = 0;
+    int frequencyRows = 0;
     int numberOfImagesInMosaic = 0;
     int encapsulatedDataFragments = 0;
     int encapsulatedDataFragmentStart = 0; //position of first FFFE,E000 for compressed images
@@ -4677,10 +4681,10 @@ double TE = 0.0; //most recent echo time recorded
                 break;
          	}
             case kMediaStorageSOPInstanceUID : {// 0002, 0003
-            	char SOPInstanceUID[kDICOMStr];
-            	dcmStr (lLength, &buffer[lPos], SOPInstanceUID);
+            	//char SOPInstanceUID[kDICOMStr];
+            	dcmStr (lLength, &buffer[lPos], d.instanceUID);
             	//printMessage(">>%s\n", d.seriesInstanceUID);
-            	d.instanceUidCrc = mz_crc32X((unsigned char*) &SOPInstanceUID, strlen(SOPInstanceUID));
+            	d.instanceUidCrc = mz_crc32X((unsigned char*) &d.instanceUID, strlen(d.instanceUID));
                 break;
             }
             case kTransferSyntax: {
@@ -4747,7 +4751,7 @@ double TE = 0.0; //most recent echo time recorded
                 printError("OSIRIX Detected\n");
             	break; }*/
             case kImplementationVersionName: {
-            	char impTxt[kDICOMStr];
+                char impTxt[kDICOMStr];
                 dcmStr (lLength, &buffer[lPos], impTxt);
                 int slen = (int) strlen(impTxt);
 				//if ((slen > 5) && (strstr(impTxt, "dcm4che") != NULL) )
@@ -5367,8 +5371,8 @@ double TE = 0.0; //most recent echo time recorded
            	case kTriggerTime:
 				//untested method to detect slice timing for GE PSD “epi” with multiphase option
 				// will not work for current PSD “epiRT” (BrainWave RT, fMRI/DTI package provided by Medical Numerics)
-            	if (d.manufacturer != kMANUFACTURER_GE) break;
-            	d.triggerDelayTime = dcmStrFloat(lLength, &buffer[lPos]);
+            	if (d.manufacturer != kMANUFACTURER_GE) break;            	
+            	d.triggerDelayTime = dcmStrFloat(lLength, &buffer[lPos]); //???? issue 336
             	d.CSA.sliceTiming[acquisitionTimesGE_UIH] = d.triggerDelayTime;
                 //printf("%g\n", d.CSA.sliceTiming[acquisitionTimesGE_UIH]);
 				acquisitionTimesGE_UIH ++;
@@ -5419,6 +5423,10 @@ double TE = 0.0; //most recent echo time recorded
             			d.phaseEncodingLines = acquisitionMatrix[3];
             		if (acquisitionMatrix[2] > 0)
             			d.phaseEncodingLines = acquisitionMatrix[2];
+            		if (acquisitionMatrix[1] > 0)
+            			frequencyRows = acquisitionMatrix[1];
+            		if (acquisitionMatrix[0] > 0)
+            			frequencyRows = acquisitionMatrix[0];
             	}
             	break;
             case kFlipAngle :
@@ -6196,6 +6204,13 @@ double TE = 0.0; //most recent echo time recorded
         printError("Unable to decode %d-bit images with Transfer Syntax 1.2.840.10008.1.2.4.51, decompress with dcmdjpg or gdcmconv\n", d.bitsAllocated);
         d.isValid = false;
     }
+    
+    if ((d.CSA.mosaicSlices < 1) && (numberOfImagesInMosaic < 1) && (!isInterpolated) && (d.phaseEncodingLines > 0)  && (frequencyRows > 0) && ((d.xyzDim[1] % frequencyRows) == 0) && ((d.xyzDim[1] / frequencyRows) > 2) && ((d.xyzDim[2] % d.phaseEncodingLines) == 0) && ((d.xyzDim[2] / d.phaseEncodingLines) > 2)  ) {
+        //n.b. in future check if frequency is in row or column direction (and same with phase)
+        // >2 avoids detecting interpolated as mosaic, in future perhaps check "isInterpolated"
+        numberOfImagesInMosaic = (d.xyzDim[1]/frequencyRows) * (d.xyzDim[2]/d.phaseEncodingLines);
+        printWarning("Guessing this is a mosaic up to %d slices (issue 337).\n",  numberOfImagesInMosaic);    
+    }    
     if ((numberOfImagesInMosaic > 1) && (d.CSA.mosaicSlices < 1))
     	d.CSA.mosaicSlices = numberOfImagesInMosaic;
     if (d.isXA10A) d.manufacturer = kMANUFACTURER_SIEMENS; //XA10A mosaics omit Manufacturer 0008,0070!
@@ -6404,8 +6419,12 @@ if (d.isHasPhase)
         d.CSA.numDti = 0;
     }
     if ((d.isValid) && (d.imageNum == 0)) { //Philips non-image DICOMs (PS_*, XX_*) are not valid images and do not include instance numbers
-    	printError("Instance number (0020,0013) not found: %s\n", fname);
-        d.imageNum = 1; //not set
+    	//TYPE 1 for MR image http://dicomlookup.com/lookup.asp?sw=Tnumber&q=(0020,0013)
+    	// Only type 2 for some other DICOMs! Therefore, generate warning not error
+    	printWarning("Instance number (0020,0013) not found: %s\n", fname);
+    	d.imageNum = abs((int)d.instanceUidCrc) % 2147483647;//INT_MAX;
+    	if (d.imageNum == 0) d.imageNum = 1; //https://github.com/rordenlab/dcm2niix/issues/341
+    	//d.imageNum = 1; //not set
     }
     if ((numDimensionIndexValues < 1) && (d.manufacturer == kMANUFACTURER_PHILIPS) && (d.seriesNum > 99999) && (philMRImageDiffBValueNumber > 0)) {
     	//Ugly kludge to distinguish Philips classic DICOM dti
